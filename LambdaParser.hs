@@ -8,12 +8,15 @@ import Data.List
   <letter> = [a-z,A-Z,0-9]
   <var> ::= <letter>|<letter><var>
   <abs> ::= /<var>.<term>
-  <apl> ::= (<term> <term>)
-  <term> ::= <var>|<abs>|<apl>
+  <apl> ::= <term> <term>
+  <term> ::= <var>|<abs>|<apl>|<group>
+  <group> ::= (<term>)
 
   Comments: 
-  I chose '/' for lambda instead of '\' because the backslash already 
-  has a unique meaning in strings.
+  * I chose '/' for lambda instead of '\' because the backslash already 
+   means the escape character in C-style strings.
+  * Since parentheses are simply used to explicitly delimit terms, they
+   do not get their own type constructor but are merely handled by the parser.
 -}
 
 -- Here we define the abstract syntax, the desired end result of parsing a string.
@@ -34,37 +37,52 @@ type Parser = Result -> Result
 
 -- Somehow, this name is both inappropriate and appropriate.
 shitshow :: String -> IO ()
-shitshow s = case (parseTerm (Epsilon, s) id) of
+shitshow xs = case (parseTerm (Epsilon, xs) id) of
                (t,"") -> print t
-               (t,s) -> print t >> putStr "Leftovers: " >> print s
+               (t,xs) -> print t >> putStr "Leftovers: " >> print xs
 
 parse :: String -> Term
-parse s = case (parseTerm (Epsilon,s) id) of 
+parse xs = case (parseTerm (Epsilon,xs) id) of 
             (t,"") -> t
-            (t,s) -> error "Incomplete Parse"
+            (t,xs) -> error ("Result: " ++ (show t) ++ "\nLeftovers: " ++ (show xs))
 
 parseTerm :: Result -> Parser -> Result
-parseTerm txs@(_,('(':xs)) p = parseApplication txs p
-parseTerm txs@(_,('/':xs)) p = parseAbstraction txs p
-parseTerm txs@(_,(a:xs)) p | elem a legalVarChars = parseVariable txs p
-parseTerm (_,(_:xs)) p = error "parseTerm: shit happened."
+parseTerm txs@(_,"")       p = p (Epsilon,"")
+parseTerm txs@(_,('(':xs)) p = p $ parseGroup txs       $ \t -> parseApplicationIfNecessary t
+parseTerm txs@(_,('/':xs)) p = p $ parseAbstraction txs $ \t -> parseApplicationIfNecessary t
+parseTerm txs              p = p $ parseVariable txs    $ \t -> parseApplicationIfNecessary t
 
--- Note: the leading '(' has already been removed from the input.
-parseApplication :: Result -> Parser -> Result
-parseApplication txs p = p $ parseChar '(' txs $
-                       \paren -> parseTerm paren $ 
-                       \t1 -> parseChar ' ' t1 $
-                       \space -> parseTerm space $
-                       \t2 -> parseChar ')' t2 $
-                       \paren -> ((Application (fst t1) (fst t2)),(snd paren))
+-- The distinction between terms and subterms allows us to deal with the scope of the infix operator ' ' for Application.
+-- For example, say we're parsing "/x./y.x y".
+-- If we applied Application to the most recently parsed term, we would end up with /x.((/y x) y)
+-- In order to parse it correctly as ((/x./y x) y) we only allow top level terms to use Application.
+-- This is circumvented by inserting parentheses, which start a new call to parseTerm instead of parseSubTerm.
+parseSubTerm :: Result -> Parser -> Result
+parseSubTerm txs@(_,"")       p = p (Epsilon,"")
+parseSubTerm txs@(_,('(':xs)) p = parseGroup txs p
+parseSubTerm txs@(_,('/':xs)) p = parseAbstraction txs p
+parseSubTerm txs              p = parseVariable txs p
 
--- Note, the leading '/' has already been removed from the input.
+parseGroup :: Result -> Parser -> Result
+parseGroup txs p = p $ parseChar '(' txs $
+                   \open -> parseTerm open $
+                   \t -> parseChar ')' t $
+                   \close -> ((fst t), (snd close))
+
+parseApplicationIfNecessary :: Result -> Result
+parseApplicationIfNecessary txs = if (null (snd txs)) || (head (snd txs) /= ' ')
+                                    then txs
+                                    else parseChar ' ' txs $
+                                        \space -> parseSubTerm space $ 
+                                        \t2 -> parseApplicationIfNecessary ((Application (fst txs) (fst t2)),(snd t2))
+
+
 parseAbstraction :: Result -> Parser -> Result
 parseAbstraction txs p = p $ parseChar '/' txs $
-                       \slash -> parseVariable slash $ 
-                       \var -> parseChar '.' var $ 
-                       \dot -> parseTerm dot $ 
-                       \term -> ((Abstraction (resultToVariable var) (fst term)), (snd term))
+                         \slash -> parseVariable slash $ 
+                         \var -> parseChar '.' var $ 
+                         \dot -> parseSubTerm dot $ 
+                         \term -> ((Abstraction (resultToVariable var) (fst term)), (snd term))
 
 parseVariable :: Result -> Parser -> Result
 parseVariable (_,xs) p = p (parseVariable' "" xs)
@@ -77,23 +95,24 @@ parseVariable' var "" = ((Var var), "")
 resultToVariable :: Result -> Variable
 resultToVariable ((Var x),_) = x
 
-parseCloseParen :: Result -> Parser -> Result
-parseCloseParen (_,(')':xs)) p = p (Epsilon,xs)
-parseCloseParen (_,(_:xs)) p = error "parseCloseParen: shit happened."
-
 parseChar :: Char -> Result -> Parser -> Result
-parseChar c (_,(x:xs)) p | c == x = p (Epsilon,xs)
+parseChar c (t, [])    p = error ("parseChar expected a '" ++ [c] ++ "' but saw an empty string.")
+parseChar c (t,(x:xs)) p | c == x = p (t,xs)
                          | otherwise = error ("parseChar expected a '" ++ [c] ++ "' but saw a '" ++ [x] 
                                               ++ "' in '" ++ (x:xs) ++ "'")
 
 -------------------------------------------------------------------------
 -- P R I N T E R
 -------------------------------------------------------------------------
--- Because reverse parsers are cool
+-- Originally, this exactly mirrored the parser, but in reverse.
+-- Now the parser is more powerful and uses the ' ' as an infix operator
+-- for application instead of using '('. But this is still a nice way
+-- to render the abstract syntax because it is unambiguous.
 format :: Term -> String
 format (Var a) = a
 format (Abstraction var body) = "/" ++ var ++ "." ++ (format body)
 format (Application t1 t2) = "(" ++ (format t1) ++ " " ++ (format t2) ++ ")"
+format (Epsilon) = ""
 
 -------------------------------------------------------------------------
 -- E V A L U A T O R
@@ -108,10 +127,7 @@ freeVars(Application term1 term2) = (freeVars term1) `union` (freeVars term2)
 
 -- A "normal form" is a term that cannot be evaluated any further.
 isNormalForm :: Term -> Bool
-isNormalForm t@(Var _) = True
-isNormalForm t@(Application f g) = isStuck t
-isNormalForm t@(Abstraction _ f) = isNormalForm f
-isNormalForm _ = False
+isNormalForm t = (isStuck t) || (isValue t)
 
 -- A value is a "good" normal form.
 isValue :: Term -> Bool
@@ -120,11 +136,12 @@ isValue _ = False
 
 -- A stuck term is a "bad" normal form.
 isStuck :: Term -> Bool
+isStuck Epsilon = True
 isStuck (Var _) = True
 isStuck (Abstraction _ _) = False
-isStuck (Application a _) = isStuck a
+isStuck (Application a b) = isStuck a && isStuck b
 
--- Step a term until it is in normal form.
+-- Repeatedly step a term until it is in normal form.
 reduce :: Term -> Term
 reduce t | isNormalForm t = t
          | otherwise = reduce (step t)
@@ -134,14 +151,15 @@ eval :: Term -> IO ()
 eval t | isNormalForm t = putStrLn (format t)      -- Stop when we can step no further*
        | otherwise = do putStrLn (format t); eval (step t)
 
--- Like eval, but for the even lazier since it takes a string input, not a term.
+-- Like eval, but for the even lazier: it takes a string input, not a term.
 cal :: String -> IO ()
 cal s = eval (parse s)
 
 -- Small step semantics for lambda calculus
 step :: Term -> Term
+step t@(Epsilon) = t
 step t@(Var a) = t
-step t@(Abstraction var body) = t
+step t@(Abstraction var body) = Abstraction var (step body)
 -- Step by function evaluation. I chose lazy (call by name) evaluation, so term is not reduced first.
 step t@(Application (Abstraction var body) term) = betasub var term body
 step t@(Application term1 term2)
@@ -189,9 +207,9 @@ trouble = "(" ++ double ++ " " ++ double ++ ")"
 -------------------------------------------------------------------------
 -- L A Z Y   M A N ' S   U N I T   T E S T
 -------------------------------------------------------------------------
--- I got these from https://files.nyu.edu/cb125/public/Lambda/
 test :: IO ()
 test = do
+  -- 2014-05-10 (I got these from https://files.nyu.edu/cb125/public/Lambda/)
   test' "(/x.(it x) works)" "(it works)"
   -- Beta-reduction
   test' "(/var.((a var) (b var)) argument)" "((a argument) (b argument))"
@@ -223,7 +241,13 @@ test = do
   test' "(((/gq./l./x.((gq l) x) /q./x.(q x)) p) j)" "(p j)"
   test' "(/x.((a x) ((k x) j)) m)" "((a m) ((k m) j))"
   test' "(/x.(/x.((k x) x) j) m)" "((k j) j)"
-  -- Whew.
+  -- 2014-05-11
+  test' "/a./b.(a b) (/x./y.(y x) 2 1) (3 4)" "((1 2) (3 4))"
+  -- Epsilon tests
+  test' "" ""
+  test' "x " "(x )"
+  -- Full reduction
+  test' "1 (/x.x b)" "(1 b)"
 
 test' :: String -> String -> IO ()
 test' input reference = if (reference == (format (reduce (parse input))))
